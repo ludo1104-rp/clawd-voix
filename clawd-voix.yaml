@@ -1,0 +1,282 @@
+# Clawd, assistant vocal local pour Home Assistant (Waveshare ESP32-S3-Touch-AMOLED-2.16)
+# Écran : Clawd animé (clawd_dessin.h) + texte d'état. Son : micro, haut-parleur, mot d'éveil.
+esphome:
+  name: clawd-voix
+  friendly_name: Clawd
+  includes:
+    - clawd_dessin.h
+  on_boot:
+    priority: -100
+    then:
+      - speaker.volume_set:
+          id: haut_parleur
+          volume: 80%
+      - micro_wake_word.start:
+      - component.update: ecran
+      # Batterie : branchée en permanence, on limite la charge à 4,0 V (AXP2101, registre 0x64)
+      # pour qu'elle chauffe et vieillisse moins (risque de gonflement).
+      - lambda: |-
+          uint8_t reg = 0x64, v = 0;
+          id(bus_i2c)->write_readv(0x34, &reg, 1, &v, 1);
+          uint8_t w[2] = {0x64, (uint8_t)((v & 0xF8) | 0x01)};
+          id(bus_i2c)->write_readv(0x34, w, 2, nullptr, 0);
+          uint8_t apres = 0;
+          id(bus_i2c)->write_readv(0x34, &reg, 1, &apres, 1);
+          ESP_LOGI("batterie", "tension de charge max : avant=0x%02X apres=0x%02X (attendu 0x01 = 4,0 V)", v, apres);
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+globals:
+  - id: etat
+    type: std::string
+    initial_value: '"Clawd"'
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+i2c:
+  id: bus_i2c
+  sda: GPIO15
+  scl: GPIO14
+  scan: true
+
+spi:
+  type: quad
+  clk_pin: GPIO38
+  data_pins: [GPIO4, GPIO5, GPIO6, GPIO7]
+
+display:
+  - platform: mipi_spi
+    model: WAVESHARE-ESP32-S3-TOUCH-AMOLED-2.16
+    id: ecran
+    update_interval: never
+    lambda: |-
+      clawd_dessiner(it, id(police), id(etat));
+
+# Anime Clawd : le dessin n'est rafraîchi que si la pose change (100 ms au plus).
+interval:
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(retroeclairage).current_values.is_on() && !id(assistant).is_running() && clawd_tick(id(etat), millis());'
+          then:
+            - component.update: ecran
+
+font:
+  - file: "gfonts://Nunito@700"
+    id: police
+    size: 48
+    glyphs: " !\"%()+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzàâçéèêëîïôùûü'"
+
+touchscreen:
+  - platform: cst9220
+    id: tactile
+    interrupt_pin: GPIO11
+    reset_pin: GPIO40
+    on_touch:
+      - if:
+          condition:
+            light.is_off: retroeclairage
+          then:
+            - light.turn_on: retroeclairage
+          else:
+            - if:
+                condition:
+                  not:
+                    voice_assistant.is_running:
+                then:
+                  - voice_assistant.start:
+
+i2s_audio:
+  - id: bus_audio
+    i2s_lrclk_pin: GPIO45
+    i2s_bclk_pin: GPIO9
+    i2s_mclk_pin: GPIO42
+
+audio_dac:
+  - platform: es8311
+    id: codec_sortie
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_adc:
+  - platform: es7210
+    id: codec_micros
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    mic_gain: 36dB
+
+microphone:
+  - platform: i2s_audio
+    id: micro
+    i2s_din_pin: GPIO10
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    correct_dc_offset: true
+    on_data:
+      - lambda: |-
+          static uint32_t dernier = 0;
+          if (millis() - dernier > 500) {
+            dernier = millis();
+            int16_t m = 0;
+            const int16_t *d = (const int16_t *) x.data();
+            size_t n = x.size() / 2;
+            for (size_t i = 0; i < n; i++) { int16_t a = d[i] < 0 ? -d[i] : d[i]; if (a > m) m = a; }
+            ESP_LOGI("niveau", "pic=%d", m);
+          }
+
+speaker:
+  - platform: i2s_audio
+    id: haut_parleur
+    i2s_dout_pin: GPIO8
+    dac_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    audio_dac: codec_sortie
+
+switch:
+  - platform: gpio
+    pin: GPIO46
+    id: ampli
+    name: "Ampli"
+    restore_mode: ALWAYS_ON
+
+voice_assistant:
+  id: assistant
+  microphone: micro
+  speaker: haut_parleur
+  noise_suppression_level: 2
+  auto_gain: 0dBFS
+  volume_multiplier: 1.0
+  on_listening:
+    - lambda: |-
+        id(etat) = "J'écoute...";
+    - component.update: ecran
+  on_stt_vad_end:
+    - micro_wake_word.stop:
+    - lambda: |-
+        id(etat) = "Je réfléchis...";
+    - component.update: ecran
+  on_tts_start:
+    - lambda: |-
+        id(etat) = "Je réponds...";
+    - component.update: ecran
+  on_end:
+    - wait_until:
+        not:
+          speaker.is_playing: haut_parleur
+    - delay: 300ms
+    - micro_wake_word.start:
+    - lambda: |-
+        id(etat) = "Clawd";
+    - component.update: ecran
+  on_error:
+    - micro_wake_word.start:
+    - lambda: |-
+        id(etat) = "Oups...";
+    - component.update: ecran
+    - delay: 2s
+    - lambda: |-
+        id(etat) = "Clawd";
+    - component.update: ecran
+
+micro_wake_word:
+  id: mot_eveil
+  microphone: micro
+  stop_after_detection: false
+  models:
+    - model: okay_nabu
+  on_wake_word_detected:
+    - if:
+        condition:
+          and:
+            - not:
+                voice_assistant.is_running:
+            - light.is_on: retroeclairage
+        then:
+          - voice_assistant.start:
+              wake_word: !lambda return wake_word;
+
+# Écran : allumé ou éteint (le contrôleur CO5300 règle la luminosité).
+light:
+  - platform: mipi_spi
+    id: retroeclairage
+    name: "Écran"
+    restore_mode: ALWAYS_ON
+    display_id: ecran
+
+# BOOT (GPIO0) : éteint / allume l'écran.
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    id: bouton_boot
+    filters:
+      - delayed_on_off: 30ms
+    on_click:
+      min_length: 30ms
+      max_length: 1500ms
+      then:
+        - logger.log: "Bouton BOOT : ecran"
+        - light.toggle: retroeclairage
+
+  # Key3 (GPIO18) : annule l'échange vocal en cours, sinon lance une commande.
+  - platform: gpio
+    pin:
+      number: GPIO18
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    id: bouton_key3
+    filters:
+      - delayed_on_off: 30ms
+    on_click:
+      min_length: 30ms
+      max_length: 1500ms
+      then:
+        - logger.log: "Bouton Key3 : voix"
+        - if:
+            condition:
+              voice_assistant.is_running:
+            then:
+              - voice_assistant.stop:
+              - micro_wake_word.start:
+              - lambda: |-
+                  id(etat) = "Clawd";
+              - component.update: ecran
+            else:
+              - if:
+                  condition:
+                    light.is_on: retroeclairage
+                  then:
+                    - voice_assistant.start:
+                  else:
+                    - light.turn_on: retroeclairage

@@ -1,0 +1,8 @@
+secrets.yaml
+.venv/
+.esphome/
+*.log
+logs.txt
+.DS_Store
+CLAUDE.md
+HISTORIQUE.md
