@@ -54,6 +54,7 @@ psram:
   speed: 80MHz
 
 logger:
+  baud_rate: 0  # pas de messages sur l'USB : le démarrage plantait sans Mac branché (26/11)
 
 globals:
   - id: etat
@@ -87,6 +88,7 @@ globals:
 api:
   encryption:
     key: !secret api_key
+  homeassistant_services: true
   actions:
     - action: afficher_alerte
       variables:
@@ -231,9 +233,21 @@ select:
           ESP_LOGI("clawd", "Déguisement : %s", x.c_str());
 
 interval:
-  - interval: 125ms  # Au plus huit images par seconde pour la jauge vocale.
+  - interval: 125ms  # Au plus huit images d'animation par seconde.
     then:
       - script.execute: rafraichir_ecran
+      - if:
+          condition:
+            and:
+              - lambda: |-
+                  const auto &minuteur = clawd_detail::minuteur;
+                  return minuteur.ecoule && minuteur.groupes_joues < 3 && !id(sonner_minuteur).is_running() &&
+                         id(etat) == "Clawd" && !id(assistant).is_running() && !id(annonce_en_cours) &&
+                         !id(preparer_ecoute).is_running() && !id(reprise_en_attente) && id(haut_parleur).is_stopped();
+              - not:
+                  media_player.is_announcing: lecteur_vocal
+          then:
+            - script.execute: sonner_minuteur
       # Si l'audio a dépassé le délai de reprise, attendre ici qu'il se libère.
       - if:
           condition:
@@ -244,8 +258,20 @@ interval:
               - not:
                   voice_assistant.is_running:
               - speaker.is_stopped: haut_parleur
+              - not:
+                  media_player.is_announcing: lecteur_vocal
           then:
             - script.execute: reprise_eveil
+
+  - interval: 25ms  # Vérifie les échéances du brossage entre deux rafraîchissements ordinaires.
+    then:
+      - lambda: |-
+          using namespace clawd_detail;
+          if (minuteur.mode == Minuteur::Mode::BROSSAGE && !minuteur.ecoule &&
+              id(retroeclairage).remote_values.is_on() && !id(assistant).is_running() &&
+              pas_brosse(millis() - minuteur.debut) != pas_brosse(affichage.brossage_dessine)) {
+            id(rafraichir_ecran).execute();
+          }
 
 script:
   - id: rafraichir_ecran
@@ -254,7 +280,6 @@ script:
           using namespace clawd_detail;
           auto &g = interaction;
           const uint32_t t = millis();
-          static uint32_t depuis = 0, nombre = 0, total_us = 0, max_us = 0;
           static uint32_t derniere_heure = 0;
           static uint32_t dernier_reglage = t - DELAI_LUMINOSITE;
           static float derniere_cible = 0.0f;
@@ -262,12 +287,20 @@ script:
           const bool allume = id(retroeclairage).remote_values.is_on();
           const bool annonce = id(annonce_en_cours);
           const bool assistant_actif = id(assistant).is_running();
+          const bool lecteur_actif = id(lecteur_vocal).state == esphome::media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          const auto etat_affiche = lire_etat(id(etat));
+          const bool bande_annonce = etat_affiche == Etat::CLAWD && (annonce || lecteur_actif);
           const bool echange = id(etat) != "Clawd" || (!annonce && assistant_actif);
-          const bool audio = annonce || assistant_actif || !id(haut_parleur).is_stopped();
+          const bool audio = annonce || lecteur_actif || assistant_actif ||
+                             minuteur.sortie_sonore || !id(haut_parleur).is_stopped();
           // demarrer_ecoute affiche la pose fixe juste avant de démarrer l'assistant.
           const bool entree_ecoute = !audio && id(etat) == "J'écoute..." && affichage.etat != Etat::ECOUTE;
           const bool vocal = audio || (echange && !entree_ecoute);
           const bool prelude = id(preparer_ecoute).is_running();
+          const bool interface_libre = !audio && !prelude && id(etat) == "Clawd";
+          minuteur.actualiser(t);
+          if (!interface_libre || id(micro_en_pause)) g.appui = false;
+          if (id(micro_en_pause)) clawd_fermer_menu();
           const bool reactions = id(reactions_clawd).state;
           const auto heure = id(horloge).now();
           const bool heure_valide = heure.is_valid();
@@ -278,7 +311,8 @@ script:
           if (heure_valide && heure.minute == 0 && heure.second == 0) {
             // Le timestamp distingue les deux occurrences de 02 h au retour à l'heure d'hiver.
             const uint32_t heure_utc = heure.timestamp / 3600;
-            if (heure_utc != derniere_heure && allume && !vocal && !prelude && !g.appui &&
+            if (heure_utc != derniere_heure && allume && !vocal && !prelude && !g.appui && !menu.ouvert &&
+                minuteur.mode != Minuteur::Mode::BROSSAGE &&
                 g.reaction == Reaction::AUCUNE && reactions) {
               g.jouer(Reaction::SAUT, t);
             }
@@ -289,7 +323,8 @@ script:
             if (alerte.active && echange) {
               id(fin_alerte).stop();
               alerte.suspendre(t);
-            } else if (!alerte.active && alerte.duree_ms && !echange && !prelude && affichage.bas_disponible(t)) {
+            } else if (!alerte.active && alerte.duree_ms && !echange &&
+                       !vocal && !prelude && affichage.bas_disponible(t)) {
               alerte.activer(t);
               id(fin_alerte).execute(alerte.duree_ms);
             }
@@ -299,28 +334,20 @@ script:
             const int mois = heure_valide ? heure.month : 0;
             const auto costume = costume_actif(id(deguisement).active_index().value_or(0), mois, jour,
                                                id(etape_matrix));
-            const auto zones = clawd_tick(id(etat), t, vocal, minute, heure.second, jour, mois,
+            const auto zones = clawd_tick(etat_affiche, t, vocal, interface_libre, bande_annonce,
+                                           minute, heure.second, jour, mois,
                                            reactions, id(temp_bureau).state,
                                            id(niveau_micro).load(std::memory_order_relaxed), costume);
-            if (zones) {
-              const uint32_t debut = vocal ? micros() : 0;
-              // Le dessin consomme les zones par transfert. Sortir si le pilote ne dessine pas.
-              for (auto reste = zones; reste; reste = affichage.zones) {
-                id(ecran).update();
-                if (affichage.zones == reste) break;
-              }
-              if (vocal) {
-                const uint32_t duree = micros() - debut;
-                if (nombre++ == 0) depuis = t;
-                total_us += duree;
-                max_us = std::max(max_us, duree);
-              }
+            // Le dessin consomme les zones par transfert. Sortir si le pilote ne dessine pas.
+            for (auto reste = zones; reste; reste = affichage.zones) {
+              id(ecran).update();
+              if (affichage.zones == reste) break;
             }
             const float luminosite = clawd_luminosite(phase, id(lampe_bureau).state);
             // Après 10 s, la prochaine actualisation utilise le dernier état reçu de la lampe.
             // Au rallumage, rétablit la luminosité tout de suite.
-            if (id(retablir_luminosite) ||
-                (luminosite != derniere_cible && t - dernier_reglage >= DELAI_LUMINOSITE)) {
+            if (!vocal && (id(retablir_luminosite) ||
+                (luminosite != derniere_cible && t - dernier_reglage >= DELAI_LUMINOSITE))) {
               derniere_cible = luminosite;
               id(retablir_luminosite) = false;
               if (id(retroeclairage).remote_values.get_brightness() != luminosite) {
@@ -332,12 +359,6 @@ script:
                 dernier_reglage = millis();
               }
             }
-          }
-          // Regroupe les mesures de dessin par fenêtres de cinq secondes.
-          if (nombre && (!vocal || t - depuis >= 5000)) {
-            ESP_LOGD("ecran", "%u mises à jour vocales : moyenne %u µs, max %u µs",
-                     (unsigned) nombre, (unsigned) (total_us / nombre), (unsigned) max_us);
-            nombre = total_us = max_us = 0;
           }
 
   - id: fin_alerte
@@ -379,7 +400,7 @@ script:
             lambda: |-
               return id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
                      !id(micro_en_pause) && !id(annonce_en_cours) &&
-                     !id(assistant).is_running() && id(haut_parleur).is_stopped();
+                     !id(assistant).is_running() && id(haut_parleur).is_stopped() && !id(sonner_minuteur).is_running();
           then:
             - script.stop: appui_long
             - lambda: |-
@@ -406,7 +427,7 @@ script:
             lambda: |-
               return id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
                      !id(micro_en_pause) && !id(annonce_en_cours) &&
-                     !id(assistant).is_running() && id(haut_parleur).is_stopped();
+                     !id(assistant).is_running() && id(haut_parleur).is_stopped() && !id(sonner_minuteur).is_running();
           then:
             - script.stop: appui_long
             - lambda: |-
@@ -432,10 +453,36 @@ script:
     then:
       - if:
           condition:
-            lambda: 'return id(issue_vocale) != int(clawd_detail::Issue::AUCUNE);'
+            lambda: 'return id(annonce_en_cours) || id(issue_vocale) != int(clawd_detail::Issue::AUCUNE);'
           then:
-            - lambda: 'id(issue_vocale) = int(clawd_detail::Issue::ERREUR);'
+            - lambda: |-
+                using clawd_detail::Issue;
+                if (id(issue_vocale) != int(Issue::AUCUNE)) id(issue_vocale) = int(Issue::ERREUR);
+                id(ecoute_micro).store(false, std::memory_order_release);
             - script.execute: reprise_eveil
+
+  - id: passer_en_reflexion
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(issue_vocale) == int(clawd_detail::Issue::EN_COURS) && id(etat) == "J'écoute...";
+          then:
+            - micro_wake_word.stop:
+            - script.execute:
+                id: afficher_etat
+                texte: "Je réfléchis..."
+
+  - id: passer_en_reponse
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(issue_vocale) == int(clawd_detail::Issue::EN_COURS) && id(etat) != "Je réponds...";
+          then:
+            - script.execute:
+                id: afficher_etat
+                texte: "Je réponds..."
 
   - id: liberer_micro
     mode: restart
@@ -445,7 +492,9 @@ script:
       - delay: 20ms
       - if:
           condition:
-            lambda: 'return (id(micro_en_pause) || id(annonce_en_cours)) && id(mot_eveil).is_running();'
+            lambda: |-
+              return (id(micro_en_pause) || id(annonce_en_cours) || id(sonner_minuteur).is_running()) &&
+                     id(mot_eveil).is_running();
           then:
             - micro_wake_word.stop:
 
@@ -454,19 +503,17 @@ script:
     then:
       - lambda: 'id(reprise_en_attente) = true;'
       - wait_until:
-          condition:
+          condition: &audio_libre_reprise
             and:
               - speaker.is_stopped: haut_parleur
               - not:
                   voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing: lecteur_vocal
           timeout: 5s
       - delay: 300ms  # Laisse le bus I²S se libérer avant de réarmer le mot d'éveil.
       - if:
-          condition:
-            and:
-              - speaker.is_stopped: haut_parleur
-              - not:
-                  voice_assistant.is_running:
+          condition: *audio_libre_reprise
           then:
             - lambda: |-
                 using namespace clawd_detail;
@@ -480,18 +527,169 @@ script:
                 if (issue == Issue::ERREUR) interaction.jouer(Reaction::TRISTE, t);
             - if:
                 condition:
-                  lambda: 'return !id(micro_en_pause);'
+                  lambda: 'return !id(micro_en_pause) && !id(sonner_minuteur).is_running();'
                 then:
                   - micro_wake_word.start:
             - script.execute:
                 id: afficher_etat
                 texte: "Clawd"
 
+  - id: basculer_bureau
+    then:
+      - homeassistant.action:
+          action: light.toggle
+          data:
+            entity_id: light.bureau
+
+  - id: changer_deguisement
+    then:
+      - lambda: |-
+          using namespace clawd_detail;
+          const auto heure = id(horloge).now();
+          const auto costume = costume_actif(id(deguisement).active_index().value_or(0),
+                                             heure.is_valid() ? heure.month : 0, heure.day_of_month,
+                                             id(etape_matrix));
+          const auto suivant = costume_suivant(costume);
+          if (costume != Costume::MATRIX && suivant != Costume::MATRIX &&
+              id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
+              !id(annonce_en_cours) && !id(preparer_ecoute).is_running() &&
+              !id(assistant).is_running() && !id(sonner_minuteur).is_running() && id(haut_parleur).is_stopped()) {
+            interaction.jouer(Reaction::SURSAUT, millis());
+          }
+          if (suivant == Costume::MATRIX) {
+            id(etape_matrix) = int(suivant);
+            // Publier Aucun sans déclencher set_action, qui quitte Matrix.
+            id(deguisement).publish_state(size_t(Costume::AUCUN));
+            ESP_LOGI("clawd", "Déguisement : Matrix");
+          } else {
+            id(deguisement).make_call().set_index(size_t(suivant)).perform();
+          }
+      - script.execute: rafraichir_ecran
+
+  - id: sonner_minuteur
+    then:
+      - script.stop: appui_long
+      - lambda: |-
+          clawd_detail::interaction.appui = false;
+          clawd_fermer_menu();
+          // Préparer le PCM avant toute prise du bus par le haut-parleur.
+          (void) clawd_detail::pcm_melodie_minuteur();
+      - if:
+          condition:
+            lambda: 'return clawd_detail::minuteur.mode == clawd_detail::Minuteur::Mode::BROSSAGE;'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(retroeclairage).remote_values.is_on();'
+                then:
+                  - delay: !lambda 'return clawd_detail::DUREE_BRAVO;'
+            - lambda: 'clawd_detail::minuteur.mode = clawd_detail::Minuteur::Mode::CARILLON_BROSSAGE;'
+      - script.execute: liberer_micro
+      - wait_until:
+          condition:
+            lambda: &micro_libere |-
+              return id(micro).is_stopped() && !id(mot_eveil).is_running() && !id(liberer_micro).is_running();
+          timeout: 2s
+      - if:
+          condition:
+            lambda: *micro_libere
+          then:
+            - while:
+                condition:
+                  lambda: 'return clawd_detail::minuteur.ecoule && clawd_detail::minuteur.groupes_joues < 3;'
+                then:
+                  - if:
+                      condition:
+                        lambda: 'return id(retroeclairage).remote_values.is_on();'
+                      then:
+                        - lambda: |-
+                            using namespace clawd_detail;
+                            interaction.jouer(Reaction::REVEIL, millis());
+                        - script.execute: rafraichir_ecran
+                        - wait_until:
+                            condition:
+                              lambda: |-
+                                using namespace clawd_detail;
+                                return interaction.reaction != Reaction::REVEIL ||
+                                       !id(retroeclairage).remote_values.is_on() ||
+                                       millis() - interaction.debut_reaction >= DUREE_REVEIL;
+                        - script.execute: rafraichir_ecran
+                  - lambda: |-
+                      auto &minuteur = clawd_detail::minuteur;
+                      minuteur.sortie_sonore = true;
+                      minuteur.octets_envoyes = 0;
+                      id(haut_parleur).start();
+                  - wait_until:
+                      condition:
+                        speaker.is_playing: haut_parleur
+                      timeout: 1s
+                  - if:
+                      condition:
+                        speaker.is_playing: haut_parleur
+                      then:
+                        - lambda: '++clawd_detail::minuteur.groupes_joues;'
+                        - wait_until:
+                            condition:
+                              lambda: |-
+                                using namespace clawd_detail;
+                                if (!id(haut_parleur).is_running()) return true;
+                                const auto &pcm = pcm_melodie_minuteur();
+                                auto &position = minuteur.octets_envoyes;
+                                // Le tampon I2S de 500 ms accepte une écriture partielle sans bloquer.
+                                position += id(haut_parleur).play(pcm.data() + position, pcm.size() - position);
+                                return position == pcm.size();
+                            timeout: 2s
+                        - if:
+                            condition:
+                              lambda: |-
+                                using namespace clawd_detail;
+                                return minuteur.octets_envoyes == pcm_melodie_minuteur().size();
+                            then:
+                              - speaker.finish: haut_parleur
+                            else:
+                              - logger.log:
+                                  level: WARN
+                                  format: "Minuteur : carillon interrompu par la sortie I2S"
+                              - speaker.stop: haut_parleur
+                              - lambda: 'clawd_detail::minuteur.groupes_joues = 3;'
+                      else:
+                        - speaker.stop: haut_parleur
+                        - lambda: 'clawd_detail::minuteur.groupes_joues = 3;'
+                  - wait_until:
+                      speaker.is_stopped: haut_parleur
+                  - lambda: 'clawd_detail::minuteur.sortie_sonore = false;'
+                  - if:
+                      condition:
+                        lambda: |-
+                          return clawd_detail::minuteur.groupes_joues < 3 &&
+                                 !id(retroeclairage).remote_values.is_on();
+                      then:
+                        - delay: 450ms
+          else:
+            - logger.log:
+                level: WARN
+                format: "Minuteur : bus I2S encore occupé par le micro"
+      - lambda: |-
+          clawd_detail::minuteur.groupes_joues = 3;
+          clawd_detail::terminer_reveil();
+      - script.execute: rafraichir_ecran
+      - script.execute: reprise_eveil
+
+  - id: interrompre_sonnerie
+    then:
+      - script.stop: sonner_minuteur
+      - lambda: |-
+          auto &minuteur = clawd_detail::minuteur;
+          if (minuteur.sortie_sonore) id(haut_parleur).stop();
+          minuteur.sortie_sonore = false;
+          clawd_detail::terminer_reveil();
+
 font:
   - file: "gfonts://Nunito@700"
     id: petite_police
-    size: 22
-    glyphs: " '.Jcdefhilnoprstué"
+    size: 24
+    bpp: 2
+    glyphs: " Jcdefhilnoprstué’…"
 
 touchscreen:
   - platform: cst9220
@@ -502,34 +700,70 @@ touchscreen:
       - if:
           condition:
             lambda: |-
-              return id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
-                     !id(micro_en_pause) && !id(annonce_en_cours) && !id(assistant).is_running() &&
-                     id(haut_parleur).is_stopped() && !id(preparer_ecoute).is_running();
+              auto &minuteur = clawd_detail::minuteur;
+              minuteur.actualiser(millis());
+              return minuteur.ecoule || minuteur.mode == clawd_detail::Minuteur::Mode::BROSSAGE;
           then:
+            - script.stop: appui_long
+            - lambda: |-
+                using namespace clawd_detail;
+                interaction.appui = false;
+                if (minuteur.mode == Minuteur::Mode::BROSSAGE) menu.ferme_a = millis();
+                minuteur.effacer();
             - if:
                 condition:
-                  lambda: 'return clawd_appuyer(millis(), touch.x, touch.y, touch.id);'
+                  script.is_running: sonner_minuteur
                 then:
-                  - script.execute: appui_long
+                  - script.execute: interrompre_sonnerie
+                  - script.execute: reprise_eveil
             - script.execute: rafraichir_ecran
+          else:
+            - if:
+                condition:
+                  lambda: &tactile_disponible |-
+                    // Le geste d'ouverture suit la même pause micro que le toucher normal.
+                    return id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
+                           !id(micro_en_pause) && !id(annonce_en_cours) && !id(assistant).is_running() &&
+                           id(haut_parleur).is_stopped() && !id(preparer_ecoute).is_running() &&
+                           !id(sonner_minuteur).is_running() &&
+                           id(lecteur_vocal).state != esphome::media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+                then:
+                  - lambda: |-
+                      using namespace clawd_detail;
+                      const uint32_t t = millis();
+                      ESP_LOGI("tactile", "appui x=%d y=%d menu=%d", (int) touch.x, (int) touch.y, (int) menu.ouvert);
+                      if (menu.ouvert) {
+                        const auto choix = clawd_toucher_menu(t, touch.x, touch.y);
+                        if (choix == ChoixMenu::BUREAU) id(basculer_bureau).execute();
+                        if (choix == ChoixMenu::DEGUISEMENT) id(changer_deguisement).execute();
+                      } else if (clawd_appuyer(t, touch.x, touch.y, touch.id)) {
+                        id(appui_long).execute();
+                      }
+                  - script.execute: rafraichir_ecran
     on_update:
-      - lambda: |-
-          using esphome::touchscreen::STATE_PRESSED;
-          using esphome::touchscreen::STATE_UPDATED;
-          auto &g = clawd_detail::interaction;
-          if (!g.appui) return;
-          for (const auto &point : touches) {
-            if (point.id == g.doigt && (point.state == STATE_PRESSED || point.state == STATE_UPDATED)) {
-              g.suivre(point.x);
-              break;
-            }
-          }
+      - if:
+          condition:
+            lambda: *tactile_disponible
+          then:
+            - lambda: |-
+                using esphome::touchscreen::STATE_PRESSED;
+                using esphome::touchscreen::STATE_UPDATED;
+                const auto &g = clawd_detail::interaction;
+                if (!g.appui) return;
+                for (const auto &point : touches) {
+                  if (point.id == g.doigt && (point.state == STATE_PRESSED || point.state == STATE_UPDATED)) {
+                    ESP_LOGI("tactile", "suivi x=%d y=%d", (int) point.x, (int) point.y);
+                    if (clawd_suivre_appui(millis(), point.x, point.y)) id(rafraichir_ecran).execute();
+                    break;
+                  }
+                }
     on_release:
       - script.stop: appui_long
       - if:
           condition:
-            lambda: |-
-              return id(retroeclairage).remote_values.is_on() && clawd_relacher(millis());
+            and:
+              - lambda: 'return clawd_relacher(millis());'
+              - lambda: *tactile_disponible
           then:
             - script.execute:
                 id: preparer_ecoute
@@ -608,6 +842,15 @@ media_player:
       format: FLAC
       sample_rate: 16000
       num_channels: 1
+    on_announcement:
+      # Couvre aussi les annonces envoyées au lecteur sans passer par Assist.
+      - lambda: 'clawd_fermer_menu();'
+      - if:
+          condition:
+            script.is_running: sonner_minuteur
+          then:
+            - script.execute: interrompre_sonnerie
+            - script.execute: reprise_eveil
 
 switch:
   - platform: template
@@ -631,7 +874,14 @@ voice_assistant:
   auto_gain: 0dBFS
   volume_multiplier: 1.0
   on_listening:
+    - if:
+        condition:
+          script.is_running: sonner_minuteur
+        then:
+          - script.execute: interrompre_sonnerie
+    - script.stop: reprise_eveil
     - lambda: |-
+        id(reprise_en_attente) = false;
         id(annonce_en_cours) = false;
         id(issue_vocale) = int(clawd_detail::Issue::EN_COURS);
     - micro_wake_word.stop:
@@ -639,23 +889,43 @@ voice_assistant:
         id: afficher_etat
         texte: "J'écoute..."
   on_stt_vad_end:
-    - micro_wake_word.stop:
-    - script.execute:
-        id: afficher_etat
-        texte: "Je réfléchis..."
+    - script.execute: passer_en_reflexion
+  # Certains fournisseurs terminent la transcription sans envoyer STT_VAD_END.
+  on_stt_end:
+    - script.execute: passer_en_reflexion
+  on_intent_start:
+    - script.execute: passer_en_reflexion
+  on_intent_progress:
+    - if:
+        condition:
+          lambda: 'return !x.empty();'  # Une URL indique que le lecteur a reçu l'audio en streaming.
+        then:
+          - script.execute: passer_en_reponse
   on_tts_start:
     # Pour une annonce, ESPHome appelle ce déclencheur avant de mettre le son en file.
     - if:
         condition:
           lambda: 'return id(issue_vocale) == int(clawd_detail::Issue::EN_COURS);'
         then:
-          - script.execute:
-              id: afficher_etat
-              texte: "Je réponds..."
+          - script.execute: passer_en_reponse
         else:
-          - lambda: 'id(annonce_en_cours) = true;'
-          - script.stop: preparer_ecoute
-          - script.execute: liberer_micro
+          - if:
+              condition:
+                lambda: 'return !id(reprise_en_attente);'
+              then:
+                - lambda: |-
+                    id(annonce_en_cours) = true;
+                    clawd_fermer_menu();
+                - if:
+                    condition:
+                      script.is_running: sonner_minuteur
+                    then:
+                      - script.execute: interrompre_sonnerie
+                - script.stop: preparer_ecoute
+                - script.execute: liberer_micro
+                - script.execute: rafraichir_ecran
+  on_tts_end:
+    - script.execute: passer_en_reponse
   on_end:
     # Pour une annonce, on_end arrive dès la mise en file. La reprise attend le silence.
     - if:
@@ -665,6 +935,7 @@ voice_assistant:
           - lambda: |-
               using clawd_detail::Issue;
               if (id(issue_vocale) == int(Issue::EN_COURS)) id(issue_vocale) = int(Issue::REUSSITE);
+              id(ecoute_micro).store(false, std::memory_order_release);
           - script.execute: reprise_eveil
   on_error:
     - script.execute: signaler_erreur
@@ -703,11 +974,12 @@ light:
           auto &g = clawd_detail::interaction;
           g.appui = false;
           g.reaction = clawd_detail::Reaction::AUCUNE;
+          clawd_fermer_menu();
           clawd_detail::alerte.effacer();
 
 binary_sensor:
   - platform: homeassistant
-    entity_id: light.bureau_ludo
+    entity_id: light.bureau
     id: lampe_bureau
     internal: true
     trigger_on_initial_state: true
@@ -730,28 +1002,7 @@ binary_sensor:
       - min_length: 30ms
         max_length: 1499ms
         then:
-          - lambda: |-
-              using namespace clawd_detail;
-              const auto heure = id(horloge).now();
-              const auto costume = costume_actif(id(deguisement).active_index().value_or(0),
-                                                 heure.is_valid() ? heure.month : 0, heure.day_of_month,
-                                                 id(etape_matrix));
-              const auto suivant = costume_suivant(costume);
-              if (costume != Costume::MATRIX && suivant != Costume::MATRIX &&
-                  id(retroeclairage).remote_values.is_on() && id(etat) == "Clawd" &&
-                  !id(annonce_en_cours) && !id(preparer_ecoute).is_running() &&
-                  !id(assistant).is_running() && id(haut_parleur).is_stopped()) {
-                interaction.jouer(Reaction::SURSAUT, millis());
-              }
-              if (suivant == Costume::MATRIX) {
-                id(etape_matrix) = int(suivant);
-                // Publier Aucun sans déclencher set_action, qui quitte Matrix.
-                id(deguisement).publish_state(size_t(Costume::AUCUN));
-                ESP_LOGI("clawd", "Déguisement : Matrix");
-              } else {
-                id(deguisement).make_call().set_index(size_t(suivant)).perform();
-              }
-          - script.execute: rafraichir_ecran
+          - script.execute: changer_deguisement
       - min_length: 1500ms
         max_length: 6s
         then:

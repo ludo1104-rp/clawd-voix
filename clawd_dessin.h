@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -19,8 +20,13 @@ namespace clawd_detail {
 inline constexpr int T = 24;
 // Durées des gestes en millisecondes.
 inline constexpr uint32_t TOUCHER_COURT = 600, APPUI_LONG = 700;
+inline constexpr uint32_t DUREE_BALAYAGE = 1200, DELAI_MENU = 8000;
+inline constexpr int BORD_BALAYAGE = 100, COURSE_BALAYAGE = 45, DERIVE_TOUCHER = 30;
 inline constexpr uint32_t DUREE_SURSAUT = 300, DUREE_ETOURDI = 1500;
 inline constexpr uint32_t DUREE_ETIREMENT = 700, PAS_SAUT = 110;
+inline constexpr uint32_t DUREE_REVEIL = 2500, PAS_REVEIL = 125, DUREE_RETOUR_REVEIL = 375;
+inline constexpr uint32_t DUREE_ZONE_DENTS = 30000, DUREE_BROSSAGE = 4 * DUREE_ZONE_DENTS;
+inline constexpr uint32_t FREQUENCE_BROSSE = 6, DUREE_CHANGEMENT_DENTS = 2500, DUREE_BRAVO = 2000;
 inline constexpr uint32_t ATTITUDE_MIN = 20000, ATTITUDE_MAX = 40000;
 // Une image de repos au plus toutes les 84 ms, et une image BAS toutes les 125 ms.
 inline constexpr uint32_t PAS_PERSO = 84, PAS_BAS = 125;
@@ -57,11 +63,13 @@ inline constexpr PalettePerso C_PERSO{
 };
 enum class Etat { INCONNU, CLAWD, ECOUTE, REFLEXION, REPONSE };
 enum class Phase { JOUR, SOIR };
-enum Zone : uint8_t {
+enum Zone : uint16_t {
   HEURE = 1, PERSO = 2, BAS = 4, DEUX_POINTS = 8, ICONE_ALERTE = 16, DATE = 32,
-  COMPLET = HEURE | DATE | PERSO | BAS
+  MINUTEUR = 64, MENU_MINUTEUR = 128, MENU_BUREAU = 256, MENU_DEGUISEMENT = 512,
+  COMPLET = 1024, PASTILLES_VOCALES = 2048,
+  BROSSAGE_COMPLET = 4096, BROSSAGE_TEMPS = 8192, BROSSAGE_PERSO = 16384, BROSSAGE_CONSIGNE = 32768
 };
-enum class Reaction : uint8_t { AUCUNE, SURSAUT, CALIN, ETOURDI, CONTENT, TRISTE, SAUT };
+enum class Reaction : uint8_t { AUCUNE, SURSAUT, CALIN, ETOURDI, CONTENT, TRISTE, SAUT, REVEIL, RETOUR_REVEIL };
 enum class Issue { AUCUNE, EN_COURS, REUSSITE, ERREUR };
 // Le select utilise les indices 0 à 2. Matrix garde la valeur 6 mémorisée depuis la mission 7.
 enum class Costume : uint8_t { AUCUN = 1, NOEL = 2, MATRIX = 6 };
@@ -204,11 +212,16 @@ inline Animation animation;
 struct Interaction {
   Reaction reaction = Reaction::AUCUNE;
   uint32_t debut_reaction = 0;
+  Frame pose_retour_reveil{};
+  bool retour_reveil_commence = false;
   bool appui = false;
   bool appui_perso = false;
   bool calin_joue = false;
   uint32_t debut_appui = 0;
   uint8_t doigt = 0;
+  int x_depart = 0, x_courant = 0, y_depart = 0;
+  int deplacement_max_carre = 0;
+  bool balayage = false;
   int regard = 0;
 
   void jouer(Reaction nouvelle, uint32_t t) {
@@ -216,13 +229,121 @@ struct Interaction {
     debut_reaction = t;
   }
 
-  void suivre(int x) {
+  bool a_derive() const { return deplacement_max_carre > DERIVE_TOUCHER * DERIVE_TOUCHER; }
+
+  void suivre(int x, int y) {
+    x_courant = x;
+    const int dx = x - x_depart, dy = y - y_depart;
+    deplacement_max_carre = std::max(deplacement_max_carre, dx * dx + dy * dy);
     // Zone neutre de deux cases autour du milieu du personnage.
     regard = x < 9 * T ? -1 : x >= 11 * T ? 1 : 0;
   }
 };
 
 inline Interaction interaction;
+
+inline void terminer_reveil() {
+  auto &g = interaction;
+  if (g.reaction != Reaction::REVEIL) return;
+  // Repartir de la pose réellement affichée, y compris après un arrêt du son.
+  g.pose_retour_reveil = animation.dessinee;
+  g.retour_reveil_commence = false;
+  g.reaction = g.pose_retour_reveil.effet == Reaction::REVEIL ? Reaction::RETOUR_REVEIL : Reaction::AUCUNE;
+}
+
+struct Menu {
+  bool ouvert = false;
+  bool doigt_pose = false;
+  uint32_t dernier_toucher = 0;
+  uint32_t ferme_a = 0u - 5000;
+
+  void toucher(uint32_t t) {
+    doigt_pose = true;
+    dernier_toucher = t;
+  }
+
+  void relacher(uint32_t t) {
+    if (!doigt_pose) return;
+    doigt_pose = false;
+    dernier_toucher = t;
+  }
+
+  bool inactif(uint32_t t) const { return ouvert && !doigt_pose && t - dernier_toucher >= DELAI_MENU; }
+};
+
+inline Menu menu;
+
+struct Minuteur {
+  enum class Mode { ORDINAIRE, BROSSAGE, CARILLON_BROSSAGE };
+
+  uint32_t debut = 0, duree = 0;
+  Mode mode = Mode::ORDINAIRE;
+  bool ecoule = false;
+  uint8_t groupes_joues = 0;
+  bool sortie_sonore = false;
+  size_t octets_envoyes = 0;
+  int choix = 5;  // Durée choisie dans le menu, en minutes (1 à 99).
+
+  void lancer(uint32_t t, int minutes) {
+    lancer_pour(t, minutes * 60000u, Mode::ORDINAIRE);
+  }
+
+  void lancer_pour(uint32_t t, uint32_t duree_ms, Mode nouveau_mode) {
+    debut = t;
+    duree = duree_ms;
+    mode = nouveau_mode;
+    ecoule = false;
+    groupes_joues = 0;
+  }
+
+  void actualiser(uint32_t t) {
+    if (duree && t - debut >= duree) ecoule = true;
+  }
+
+  void effacer() {
+    duree = 0;
+    ecoule = false;
+    mode = Mode::ORDINAIRE;
+  }
+
+  int affichage(uint32_t t) const {
+    if (!duree || mode == Mode::CARILLON_BROSSAGE) return -1;
+    if (ecoule) return 0;
+    return (duree - (t - debut) + 999) / 1000;
+  }
+};
+
+inline Minuteur minuteur;
+
+inline const auto &pcm_melodie_minuteur() {
+  constexpr int frequence_pcm = 16000;
+  constexpr int pas = frequence_pcm / 5;  // Une note toutes les 200 ms.
+  constexpr int duree_note = 2 * pas;
+  constexpr int echantillons = 6 * pas;
+  static const auto pcm = [] {
+    constexpr float notes[] = {1046.50f, 1318.51f, 1567.98f, 1318.51f, 1046.50f};  // Do, mi, sol, mi, do (octave haut : le petit haut-parleur rend mal les graves).
+    constexpr float deux_pi = 6.283185307f;
+    std::array<uint8_t, echantillons * 2> data{};
+    static_assert(echantillons == (std::size(notes) - 1) * pas + duree_note);
+    for (size_t n = 0; n < std::size(notes); ++n) {
+      const float rotation = deux_pi * notes[n] / frequence_pcm;
+      for (int i = 0; i < duree_note; ++i) {
+        const float phase = rotation * i;
+        const float attaque = std::min(i / 128.0f, 1.0f);
+        const float queue = 1.0f - float(i) / (duree_note - 1);
+        const float onde = 0.82f * std::sin(phase) + 0.18f * std::sin(phase * 2.01f);
+        // Deux notes qui se chevauchent restent sous 18000 (limite int16 : 32767).
+        const int16_t note = 9000 * attaque * queue * queue * onde;
+        const size_t j = 2 * (n * pas + i);
+        const uint16_t valeur = (data[j] | (data[j + 1] << 8)) + note;
+        data[j] = static_cast<uint8_t>(valeur);
+        data[j + 1] = static_cast<uint8_t>(valeur >> 8);
+      }
+    }
+    return data;
+  }();
+  return pcm;
+}
 
 inline Etat lire_etat(const std::string &etat) {
   if (etat == "J'écoute...") return Etat::ECOUTE;
@@ -237,6 +358,23 @@ inline void pose_saut(Frame &f, uint32_t e) {
   f.ecrase = pas[1];
   f.gauche = pas[2];
   f.droit = pas[3];
+}
+
+inline void pose_reveil(Frame &f, uint32_t e) {
+  f.effet = Reaction::REVEIL;
+  f.lun = 2;
+  f.yeux = ECARQUILLES;
+  f.bouche = e < 3 * PAS_REVEIL ? 1 : 0;
+  f.gauche = f.droit = -2;
+  if (e < 2 * PAS_REVEIL) {
+    f.dy = -1;
+    f.dy_px = e >= PAS_REVEIL ? T / 2 : 0;
+  } else if (e >= DUREE_REVEIL - 2 * PAS_REVEIL) {
+    // Pose centrée que l'écran conserve pendant le carillon.
+    f.gauche = f.droit = -1;
+  } else if (e >= 3 * PAS_REVEIL) {
+    f.dx = (e / PAS_REVEIL) % 2 ? -1 : 1;
+  }
 }
 
 inline void pose_danse(Frame &f, uint32_t e, int dir) {
@@ -423,6 +561,32 @@ inline void calcul_reaction(Frame &f, uint32_t t, bool reactions) {
         return;
       }
       break;
+    case Reaction::REVEIL:
+      pose_reveil(f, e);
+      return;
+    case Reaction::RETOUR_REVEIL: {
+      if (!g.retour_reveil_commence) {
+        g.retour_reveil_commence = true;
+        g.debut_reaction = t;
+      }
+      const int ecoule = std::min(t - g.debut_reaction, DUREE_RETOUR_REVEIL);
+      constexpr int duree = DUREE_RETOUR_REVEIL;
+      if (ecoule == duree) break;
+      const auto costume = f.costume;
+      f = g.pose_retour_reveil;
+      f.costume = costume;
+      const int reste = duree - ecoule;
+      f.dx_px -= (f.dx * T + f.dx_px) * ecoule / duree;
+      f.dy_px -= (f.dy * T + f.dy_px) * ecoule / duree;
+      f.gauche = f.gauche * reste / duree;
+      f.droit = f.droit * reste / duree;
+      if (ecoule >= int(PAS_REVEIL)) {
+        f.effet = Reaction::AUCUNE;
+        f.lun = f.bouche = 0;
+        f.yeux = OUVERTS;
+      }
+      return;
+    }
     case Reaction::AUCUNE:
       break;
   }
@@ -454,9 +618,10 @@ inline void calcul_pose(Etat suivant, uint32_t t, bool reactions, Costume costum
   f.costume = costume;
   bool au_repos = false;
   if (suivant == Etat::CLAWD) {
-    // Surprendre et suivre le doigt restent prioritaires sur la pose d'alerte.
+    // Les gestes et le réveil sont prioritaires sur la pose d'alerte.
     const auto r = interaction.reaction;
-    const bool geste = interaction.appui || r == Reaction::SURSAUT || r == Reaction::CALIN || r == Reaction::ETOURDI;
+    const bool geste = interaction.appui || r == Reaction::SURSAUT || r == Reaction::CALIN ||
+                       r == Reaction::ETOURDI || r == Reaction::REVEIL || r == Reaction::RETOUR_REVEIL;
     if (geste || !pose_alerte(a, f, t)) {
       calcul_reaction(f, t, reactions);
       if (interaction.appui) {
@@ -484,8 +649,6 @@ inline constexpr int LARGEUR = 480;
 inline constexpr int HAUT_FIN = 64;
 inline constexpr int BAS_DEBUT = 424;
 inline constexpr int HAUTEUR = 480;
-inline constexpr int SEGMENT = 120;
-inline constexpr int BLOC = 32;
 inline constexpr int TEMP_INCONNUE = std::numeric_limits<int>::min();
 
 inline constexpr int BLOC_HEURE = 6, BLOC_DATE = 3;
@@ -503,9 +666,25 @@ inline constexpr int DATE_HAUT = DATE_Y - DECALAGE_HEURE;
 inline constexpr int DATE_BAS = DATE_Y + HAUTEUR_CHIFFRE * BLOC_DATE + DECALAGE_HEURE;
 inline constexpr int DATE_LARGEUR = (5 * PAS_GLYPHE - 1) * BLOC_DATE;
 inline constexpr int HAUT_DATE_LARGEUR = DATE_X + DATE_LARGEUR + DECALAGE_HEURE;
+inline constexpr int MINUTEUR_BLOC = 3, MINUTEUR_X = 369, MINUTEUR_Y = DATE_Y;
+inline constexpr int MINUTEUR_LARGEUR = (5 * PAS_GLYPHE - 1) * MINUTEUR_BLOC;
 static_assert(HEURE_X + HEURE_LARGEUR + DECALAGE_HEURE <= HAUT_HEURE_LARGEUR);
 static_assert(HEURE_Y + HAUTEUR_CHIFFRE * BLOC_HEURE + DECALAGE_HEURE <= HAUT_FIN);
 static_assert(DATE_BAS <= HAUT_FIN && HAUT_DATE_LARGEUR <= 300);
+static_assert(MINUTEUR_X >= 330 && MINUTEUR_X >= HAUT_HEURE_LARGEUR && MINUTEUR_X >= HAUT_DATE_LARGEUR);
+static_assert(MINUTEUR_X + MINUTEUR_LARGEUR <= LARGEUR &&
+              MINUTEUR_Y + HAUTEUR_CHIFFRE * MINUTEUR_BLOC <= HAUT_FIN);
+
+inline constexpr int TUILE_X = 24, TUILE_LARGEUR = LARGEUR - 2 * TUILE_X;
+inline constexpr int TUILE_HAUTEUR = 92, TUILE_PAS = 100, TUILE_Y = 70;
+inline constexpr int AJUST_X[] = {25, 135, 245, 355}, AJUST_LARGEUR = 100;
+inline constexpr int AJUST_PAS[] = {-5, -1, 1, 5};
+inline constexpr int ANNULER_X = 336, ANNULER_LARGEUR = 120, DEMARRER_LARGEUR = 300;
+inline constexpr int DENTS_X = 308, DENTS_Y = 80, DENTS_LARGEUR = 148, DENTS_HAUTEUR = 72;
+static_assert(TUILE_Y >= HAUT_FIN && TUILE_Y + 2 * TUILE_PAS + TUILE_HAUTEUR <= BAS_DEBUT);
+static_assert(DENTS_Y >= TUILE_Y && DENTS_Y + DENTS_HAUTEUR <= TUILE_Y + TUILE_HAUTEUR);
+
+enum class ChoixMenu { RIEN, BUREAU, DEGUISEMENT };
 
 struct Haut {
   int minute = -1;
@@ -515,23 +694,35 @@ struct Haut {
 
 struct Bas {
   int temperature = TEMP_INCONNUE;
-  int barre = 0;
+  int animation = 0;
   Etat etat = Etat::INCONNU;
+  bool annonce = false;
   uint32_t revision_alerte = 0;
   bool icone_claire = false;
 
   bool contenu_change(const Bas &autre) const {
-    return temperature != autre.temperature || barre != autre.barre || etat != autre.etat ||
-           revision_alerte != autre.revision_alerte;
+    return temperature != autre.temperature || etat != autre.etat ||
+           annonce != autre.annonce || revision_alerte != autre.revision_alerte;
   }
+};
+
+struct Tuiles {
+  bool lampe = false, minuteur = false;  // `lampe` reste faux : la rangée du milieu est fixe.
+  Costume costume = Costume::AUCUN;
+  int choix = 5;
 };
 
 struct Affichage {
   Haut haut, haut_dessine;
   Bas bas, bas_dessine;
   Etat etat = Etat::INCONNU;
-  uint8_t zones = 0;
+  uint16_t zones = 0;
   bool complet = true;
+  bool milieu_invalide = false;
+  int minuteur = -1, minuteur_dessine = -1;
+  uint32_t brossage = 0, brossage_dessine = 0;
+  bool ecran_brossage = false, brossage_invalide = true;
+  Tuiles tuiles, tuiles_dessinees;
   uint32_t debut_etat = 0;
   uint32_t t = 0, dernier_perso = 0, dernier_bas = 0u - PAS_BAS;
 
@@ -616,14 +807,8 @@ struct MasqueCode {
   }
 };
 
-inline int position_bloc(uint32_t ecoule) {
-  constexpr int course = SEGMENT - BLOC;
-  const int pas = ecoule / 10 % (2 * course);
-  return pas <= course ? pas : 2 * course - pas;
-}
-
 template<typename Rectangle>
-inline void dessiner_bonnet(const Rectangle &b, int front, int dy) {
+inline void dessiner_bonnet(const Rectangle &b, int front, float dy) {
   // Trois cases au repos. Le bonnet se tasse à la limite de PERSO pendant un saut.
   constexpr float hauteur = 3;
   const float echelle = std::min(1.0f, (front + dy - float(HAUT_FIN) / T) / hauteur);
@@ -778,25 +963,63 @@ inline void dessiner_cafe(const Rectangle &rect, int x, int y, uint8_t vapeur) {
   rect(x + 35, y - 39 - montee, 10, 12, {0xd5, 0xdf, 0xd7});
 }
 
-inline void dessiner_perso(esphome::display::Display &it, const Frame &f) {
+inline constexpr int POSITIONS_BROSSE[] = {0, 12, 18, 12, 0, -12, -18, -12};
+
+inline uint32_t pas_brosse(uint32_t ecoule) {
+  return ecoule * FREQUENCE_BROSSE / 1000;
+}
+
+inline int position_brosse(uint32_t ecoule) {
+  return POSITIONS_BROSSE[pas_brosse(ecoule) % std::size(POSITIONS_BROSSE)];
+}
+
+inline void dessiner_perso(esphome::display::Display &it, const Frame &f, int inclinaison = 0, bool bravo = false,
+                           int dx_brosse = 0) {
   const bool matrix = f.costume == Costume::MATRIX;
   const auto &couleurs = C_PERSO;
   const int X = f.dx, Y = f.dy;
   const auto px = [X, &f](float x) { return int(std::round((x + X) * T)) + f.dx_px; };
   const auto py = [Y, &f](float y) { return int(std::round((y + Y) * T)) + f.dy_px; };
   MasqueCode masque;
-  const auto rect = [&it, &masque, matrix](int x, int y, int w, int h, esphome::Color couleur) {
-    it.filled_rectangle(x, y, w, h, couleur);
+  const auto clip = inclinaison ? it.get_clipping() : esphome::display::Rect{};
+  const auto rect = [&it, &masque, matrix, &clip](int x, int y, int w, int h, esphome::Color couleur) {
+    if (clip.is_set()) {
+      const int haut = std::max(y, int(clip.y)), bas = std::min(y + h, int(clip.y2()));
+      if (bas <= haut) return;
+      it.filled_rectangle(x, haut, w, bas - haut, couleur);
+    } else {
+      it.filled_rectangle(x, y, w, h, couleur);
+    }
     if (matrix) masque.couvrir(x, y, w, h);
   };
-  const auto b = [&rect, &px, &py](float x, float y, float w, float h, esphome::Color couleur) {
-    rect(px(x), py(y), int(std::round(w * T)), int(std::round(h * T)), couleur);
+  const int amplitude = std::abs(dx_brosse);
+  const int tdy = amplitude >= 18 ? 12 : amplitude >= 12 ? 6 : 0;
+  const auto b = [&rect, &px, &py, inclinaison, tdy](float x, float y, float w, float h, esphome::Color couleur) {
+    const int gauche = px(x), haut = py(y);
+    const int largeur = int(std::round(w * T)), bas = haut + int(std::round(h * T));
+    if (!inclinaison || y >= 15) {
+      rect(gauche, haut, largeur, bas - haut, couleur);
+      return;
+    }
+    // Décaler la tête par bandes de 6 px et atténuer la pente en arrivant aux pattes.
+    constexpr int bande = T / 4;
+    for (int colonne = gauche; colonne < gauche + largeur; colonne += bande) {
+      const int pente = inclinaison * int(std::floor((colonne + bande / 2 - 228) / 66.0f + 0.5f));
+      const auto pencher = [pente, tdy](int ligne) {
+        ligne += tdy;
+        const float poids = std::clamp((360 - ligne) / 36.0f, 0.0f, 1.0f);
+        return ligne + bande * int(std::floor(pente * poids + 0.5f));
+      };
+      const int debut = pencher(haut);
+      rect(colonne, debut, std::min(bande, gauche + largeur - colonne), pencher(bas) - debut, couleur);
+    }
   };
 
   // L'ombre reste au sol et se resserre avec la hauteur du saut.
-  const int retrait = -Y;
-  rect((4 + X + retrait) * T, 17 * T, (11 - 2 * retrait) * T, T / 2, C.SOL);
-  rect((3 + X + retrait) * T + T / 2, 17 * T, (12 - 2 * retrait) * T, T / 4, C.SOL);
+  const int retrait = std::max(0, -Y * T - std::max<int>(0, f.dy_px));
+  const int ombre_x = X * T + f.dx_px + retrait;
+  rect(4 * T + ombre_x, 17 * T, 11 * T - 2 * retrait, T / 2, C.SOL);
+  rect(3 * T + ombre_x + T / 2, 17 * T, 12 * T - 2 * retrait, T / 4, C.SOL);
 
   const int front = 6 + f.ecrase;
   if (f.drapeau) {
@@ -820,9 +1043,15 @@ inline void dessiner_perso(esphome::display::Display &it, const Frame &f) {
     inscription("VIBE", py(haut) + 9);
     inscription("CODER", py(haut) + 34);
   }
-  dessiner_bras(rect, px(3), py(12), f.gauche, true, f.etirement);
+  const auto pince = [&rect, inclinaison, dx_brosse](int x, int y, int w, int h, esphome::Color col) {
+    rect(x - inclinaison * dx_brosse, y, w, h, col);
+  };
+  if (inclinaison < 0) dessiner_bras(pince, px(3), py(12), f.gauche, true, f.etirement);
+  else dessiner_bras(rect, px(3), py(12), f.gauche, true, f.etirement);
   if (f.vapeur) {
     dessiner_cafe(rect, px(15.75f), py(7.75f), f.vapeur);
+  } else if (inclinaison > 0) {
+    dessiner_bras(pince, px(16), py(12), f.droit, false, f.etirement);
   } else {
     dessiner_bras(rect, px(16), py(12), f.droit, false, f.etirement);
   }
@@ -847,7 +1076,7 @@ inline void dessiner_perso(esphome::display::Display &it, const Frame &f) {
     // Laisser aussi libres les intervalles entre les pattes.
     masque.couvrir(px(4), py(15), 11 * T, 2 * T);
   }
-  if (f.costume == Costume::NOEL) dessiner_bonnet(b, front, Y);
+  if (f.costume == Costume::NOEL) dessiner_bonnet(b, front, Y + float(f.dy_px) / T);
 
   // Visage et lunettes sont ancrés aux joues, y compris quand le front se tasse.
   if (!matrix && f.lun) {
@@ -907,7 +1136,13 @@ inline void dessiner_perso(esphome::display::Display &it, const Frame &f) {
   }
   b(5, 13.25, 1.5, 0.5, couleurs.JOUE);
   b(12.5, 13.25, 1.5, 0.5, couleurs.JOUE);
-  if (f.bouche == 1) {
+  if (bravo) {
+    b(8, 13.25, 3, 0.5, couleurs.OEIL);
+    b(8.5, 13.75, 2, 0.75, couleurs.OEIL);
+    b(8.5, 13.25, 2, 0.5, couleurs.BLANC);
+  } else if (inclinaison) {
+    b(8.25, 13, 2.5, 1.5, couleurs.OEIL);
+  } else if (f.bouche == 1) {
     b(8.5, 13, 2, 1.5, couleurs.OEIL);
     b(9, 14, 1, 0.5, couleurs.LANGUE);
   } else if (f.bouche == 2) {
@@ -929,7 +1164,12 @@ inline void dessiner_perso(esphome::display::Display &it, const Frame &f) {
     b(17, 8.25, 0.5, 0.25, C.ONDE);
   }
 
-  if (f.effet == Reaction::CALIN) {
+  if (f.effet == Reaction::REVEIL) {
+    b(1.25, 7, 0.75, 0.25, C.ONDE);
+    b(1.5, 8, 0.75, 0.25, C.ONDE);
+    b(17, 7, 0.75, 0.25, C.ONDE);
+    b(16.75, 8, 0.75, 0.25, C.ONDE);
+  } else if (f.effet == Reaction::CALIN) {
     for (int i = 0; i < 3; i++) {
       const float x = 4 + 4 * i, y = 8 - 0.5f * (i % 2) - 0.25f * f.pas;
       b(x + 0.25, y, 0.5, 0.25, C.COEUR);
@@ -1029,6 +1269,196 @@ inline void dessiner_pixels(esphome::display::Display &it, int x, int y, const u
 inline void dessiner_glyphe(esphome::display::Display &it, int x, int y, char c, int bloc,
                             int colonnes, esphome::Color col) {
   dessiner_pixels(it, x, y, PIXELS[glyphe(c)], bloc, colonnes, col);
+}
+
+inline void dessiner_texte_pixel(esphome::display::Display &it, int x, int y, const char *texte,
+                                 int bloc, esphome::Color col) {
+  for (; *texte; ++texte, x += PAS_GLYPHE * bloc) {
+    if (*texte == '+') {  // Pas dans la police : croix de 5 cases.
+      it.filled_rectangle(x, y + 3 * bloc, LARGEUR_CHIFFRE * bloc, bloc, col);
+      it.filled_rectangle(x + 2 * bloc, y + 1 * bloc, bloc, 5 * bloc, col);
+      continue;
+    }
+    dessiner_glyphe(it, x, y, *texte, bloc, LARGEUR_CHIFFRE, col);
+  }
+}
+
+inline void dessiner_texte_centre(esphome::display::Display &it, int centre, int y, const char *texte,
+                                 int bloc, esphome::Color col) {
+  const int largeur = (int(std::strlen(texte)) * PAS_GLYPHE - 1) * bloc;
+  dessiner_texte_pixel(it, centre - largeur / 2, y, texte, bloc, col);
+}
+
+inline void dessiner_bouton(esphome::display::Display &it, int x, int y, int l, int h, const char *texte,
+                            int bloc, esphome::Color col) {
+  it.rectangle(x, y, l, h, col);
+  dessiner_texte_centre(it, x + l / 2, y + (h - 7 * bloc) / 2, texte, bloc, col);
+}
+
+inline void dessiner_dent(esphome::display::Display &it, int x, int y, int pas) {
+  constexpr char motif[][10] = {
+      ".AA...AA.", "AAAAAAAAA", "AAAAAAAAA", "AACAAAABA",
+      "AAAAAAABA", ".AAABABA.", ".AAB.BBA.", "..A...A..",
+  };
+  constexpr esphome::Color palette[] = {C_PERSO.BLANC, C.REPONSE, C.TEXTE};
+  const auto rect = [&it](int x, int y, int w, int h, esphome::Color col) {
+    it.filled_rectangle(x, y, w, h, col);
+  };
+  dessiner_motif(rect, x, y, pas, pas, motif, palette);
+}
+
+inline void dessiner_tuile(esphome::display::Display &it, Zone zone, const Tuiles &tuiles) {
+  const int index = zone == MENU_MINUTEUR ? 0 : zone == MENU_BUREAU ? 1 : 2;
+  const int y = TUILE_Y + index * TUILE_PAS;
+  const int debut = index == 0 ? HAUT_FIN : y;
+  const int fin = index == 2 ? BAS_DEBUT : y + TUILE_PAS;
+  it.filled_rectangle(0, debut, LARGEUR, fin - debut, C.BG);
+  if (zone == MENU_MINUTEUR) {
+    char texte[8];
+    std::snprintf(texte, sizeof(texte), "%d MIN", tuiles.choix);
+    dessiner_texte_centre(it, 140, y + 18, texte, 8, C.TEXTE);
+    it.rectangle(DENTS_X, DENTS_Y, DENTS_LARGEUR, DENTS_HAUTEUR, C.REFLEXION);
+    dessiner_dent(it, 318, 102, 3);
+    dessiner_texte_centre(it, 395, 96, "DENTS", 3, C.REFLEXION);
+    dessiner_texte_centre(it, 395, 122, "2 MIN", 3, C.DISCRET);
+  } else if (zone == MENU_BUREAU) {
+    for (size_t i = 0; i < std::size(AJUST_X); ++i) {
+      char texte[4];
+      std::snprintf(texte, sizeof(texte), "%+d", AJUST_PAS[i]);
+      dessiner_bouton(it, AJUST_X[i], y, AJUST_LARGEUR, TUILE_HAUTEUR, texte, 5, C.REPONSE);
+    }
+  } else {
+    dessiner_bouton(it, TUILE_X, y, tuiles.minuteur ? DEMARRER_LARGEUR : TUILE_LARGEUR, TUILE_HAUTEUR,
+                    "DEMARRER", 5, C.ECOUTE);
+    if (tuiles.minuteur) dessiner_bouton(it, ANNULER_X, y, ANNULER_LARGEUR, TUILE_HAUTEUR, "STOP", 4, C.COEUR);
+    dessiner_bouton(it, TUILE_X, y + TUILE_PAS + 2, TUILE_LARGEUR, 44, "RETOUR", 3, C.DISCRET);
+  }
+}
+
+inline void dessiner_brosse(esphome::display::Display &it, bool droite, bool bas, int niveau, int dx) {
+  const auto pixel = [&it, droite](int x, int y, int w, int h, esphome::Color col) {
+    it.filled_rectangle(droite ? 456 - x - w : x, y, w, h, col);
+  };
+  const auto brosse = [&pixel, dx](int x, int y, int w, int h, esphome::Color col) {
+    pixel(x + dx, y, w, h, col);
+  };
+  const auto mousse = [&pixel](int x, int y, int pas) {
+    constexpr char motif[][5] = {".AA.", "AAAA", ".AAB"};
+    constexpr esphome::Color palette[] = {C_PERSO.BLANC, C.REPONSE};
+    dessiner_motif(pixel, x, y, pas, pas, motif, palette);
+  };
+  mousse(204, 318, 6);
+  mousse(222, 312, 6);
+  if (niveau >= 2) mousse(234, 321, 6);
+  if (niveau >= 3) {
+    mousse(198, 330, 6);
+    pixel(192, 306, 6, 6, C_PERSO.BLANC);
+  }
+  if (niveau >= 4) {
+    mousse(246, 324, 6);
+    mousse(222, 342, 4);
+    pixel(270, 314, 6, 6, C.REPONSE);
+  }
+
+  const int prise = bas ? 294 : 270;
+  const int bout = bas ? 342 : 306;
+  for (int x = 24; x < 192; x += 6) {
+    constexpr int longueur = 192 - 24, pas = 6;
+    const int y = prise + pas * (((bout - prise) * (x - 24) + longueur * pas / 2) / (longueur * pas));
+    brosse(x, y, 6, 18, C.PISTE);
+    brosse(x, y, 6, 12, C.ECOUTE);
+  }
+  brosse(186, bout, 48, 12, C.REPONSE);
+  brosse(192, bout, 36, 6, C.ECOUTE);
+  const int poils = bas ? bout - 12 : bout + 12;
+  for (int x = 192; x < 234; x += 12) brosse(x, poils, 6, 12, C_PERSO.BLANC);
+  brosse(30, prise, 12, 12, C_PERSO.CORPS);
+  brosse(30, prise, 12, 6, C_PERSO.CLAIR);
+}
+
+inline void dessiner_bulles_de_savon(esphome::display::Display &it, bool droite, uint32_t ecoule) {
+  const double t = ecoule / 1000.0;
+  for (int k = 0; k < 5; ++k) {
+    const double cycle = t * 0.7 + k * 0.2;
+    const double phase = cycle - std::floor(cycle);
+    const int taille = phase < 0.5 ? 12 : 18;
+    const int position = 190 + k * 24 + 6 * int(std::floor(std::sin(t * 5 + k * 2) + 0.5));
+    const int x = droite ? 456 - position - taille : position;
+    const int y = 6 * int(std::floor((330 - phase * 190) / 6 + 0.5));
+    it.filled_rectangle(x, y, taille, 3, C.REPONSE);
+    it.filled_rectangle(x, y + taille - 3, taille, 3, C.REPONSE);
+    it.filled_rectangle(x, y, 3, taille, C.REPONSE);
+    it.filled_rectangle(x + taille - 3, y, 3, taille, C.REPONSE);
+    it.filled_rectangle(x + 6, y + 6, 3, 3, C_PERSO.BLANC);
+  }
+}
+
+inline constexpr int BROSSAGE_TEMPS_Y = 30, BROSSAGE_TEMPS_BLOC = 12, BROSSAGE_CONSIGNE_Y = 434;
+
+inline void dessiner_temps_brossage(esphome::display::Display &it, uint32_t ecoule) {
+  const int reste = (DUREE_BROSSAGE - ecoule + 999) / 1000;
+  const char texte[] = {'0', char('0' + reste / 60), ':',
+                        char('0' + (reste % 60) / 10), char('0' + reste % 10), '\0'};
+  dessiner_texte_centre(it, LARGEUR / 2, BROSSAGE_TEMPS_Y, texte, BROSSAGE_TEMPS_BLOC,
+                        reste <= 10 ? C.NOEL : C.TEXTE);
+}
+
+inline void dessiner_perso_brossage(esphome::display::Display &it, uint32_t ecoule) {
+  const int zone = ecoule / DUREE_ZONE_DENTS;
+  const bool droite = zone % 2, bas = zone >= 2;
+  const int dx = position_brosse(ecoule);
+  Frame pose{};
+  if (!bas) {
+    if (droite) pose.droit = -1;
+    else pose.gauche = -1;
+  }
+  dessiner_perso(it, pose, droite ? 1 : -1, false, dx);
+  const int niveau = 1 + ecoule % DUREE_ZONE_DENTS / (DUREE_ZONE_DENTS / 4);
+  dessiner_brosse(it, droite, bas, niveau, dx);
+  dessiner_bulles_de_savon(it, droite, ecoule);
+}
+
+inline bool changement_dents(uint32_t ecoule) {
+  return ecoule >= DUREE_ZONE_DENTS && ecoule % DUREE_ZONE_DENTS < DUREE_CHANGEMENT_DENTS;
+}
+
+inline void dessiner_consigne_brossage(esphome::display::Display &it, uint32_t ecoule) {
+  constexpr const char *zones[] = {"HAUT GAUCHE", "HAUT DROITE", "BAS GAUCHE", "BAS DROITE"};
+  const bool changement = changement_dents(ecoule);
+  dessiner_texte_centre(it, LARGEUR / 2, BROSSAGE_CONSIGNE_Y,
+                       changement ? "ON CHANGE !" : zones[ecoule / DUREE_ZONE_DENTS], 5,
+                       changement ? C.REFLEXION : C.ECOUTE);
+}
+
+inline void dessiner_bravo(esphome::display::Display &it) {
+  constexpr int bloc = 9, y = 30;
+  constexpr char texte[] = "Bravo !";
+  constexpr uint8_t minuscules[][HAUTEUR_CHIFFRE] = {
+      {0, 0, 22, 25, 16, 16, 16}, {0, 0, 12, 2, 14, 18, 15},
+      {0, 0, 17, 17, 17, 10, 4}, {0, 0, 14, 17, 17, 17, 14},
+  };
+  int x = (LARGEUR - (int(std::strlen(texte)) * PAS_GLYPHE - 1) * bloc + 1) / 2;
+  for (size_t i = 0; texte[i]; ++i, x += PAS_GLYPHE * bloc) {
+    if (i > 0 && i <= std::size(minuscules)) {
+      dessiner_pixels(it, x, y, minuscules[i - 1], bloc, LARGEUR_CHIFFRE, C.TEXTE);
+    } else {
+      dessiner_glyphe(it, x, y, texte[i], bloc, LARGEUR_CHIFFRE, C.TEXTE);
+    }
+  }
+  Frame pose{};
+  pose.gauche = -2;
+  pose.droit = -3;
+  dessiner_perso(it, pose, 0, true);
+  dessiner_dent(it, 374, 124, 9);
+  const auto etincelle = [&it](int x, int y, int pas) {
+    it.filled_rectangle(x + 2 * pas, y, pas, 5 * pas, C.REFLEXION);
+    it.filled_rectangle(x, y + 2 * pas, 5 * pas, pas, C.REFLEXION);
+    it.filled_rectangle(x + 2 * pas, y + 2 * pas, pas, pas, C_PERSO.BLANC);
+  };
+  etincelle(352, 101, 4);
+  etincelle(435, 95, 6);
+  etincelle(440, 211, 4);
+  etincelle(87, 112, 4);
 }
 
 inline void dessiner_pluie(esphome::display::Display &it, const MasqueCode &masque) {
@@ -1269,6 +1699,17 @@ inline void dessiner_date(esphome::display::Display &it, const Haut &haut, bool 
   }
 }
 
+inline void dessiner_minuteur(esphome::display::Display &it, int secondes) {
+  it.filled_rectangle(MINUTEUR_X, MINUTEUR_Y, MINUTEUR_LARGEUR, HAUTEUR_CHIFFRE * MINUTEUR_BLOC, C.BG);
+  if (secondes >= 0) {
+    const int min = secondes / 60, sec = secondes % 60;
+    const char texte[] = {char('0' + min / 10), char('0' + min % 10), ':',
+                          char('0' + sec / 10), char('0' + sec % 10), '\0'};
+    dessiner_texte_pixel(it, MINUTEUR_X, MINUTEUR_Y, texte, MINUTEUR_BLOC, C.DISCRET);
+  }
+  pleine_largeur(it, MINUTEUR_Y, MINUTEUR_Y + HAUTEUR_CHIFFRE * MINUTEUR_BLOC - 1);
+}
+
 inline constexpr int THERMOMETRE_LARGEUR = 17, THERMOMETRE_HAUTEUR = 32;
 
 inline void dessiner_thermometre(esphome::display::Display &it, int x, int y, int dixiemes) {
@@ -1322,35 +1763,63 @@ inline void dessiner_temperature(esphome::display::Display &it, int dixiemes) {
   dessiner_glyphe(it, x + 4 * petit, unite_y, 'C', petit, 5, col);
 }
 
-inline void dessiner_bas(esphome::display::Display &it, esphome::font::Font *petite, const Bas &bas) {
+inline constexpr int PASTILLES_Y = BAS_DEBUT + 4, PASTILLES_H = 10;
+inline constexpr int PAS_ANIMATION_VOCALE = 250, NIVEAUX_MICRO = 8;
+
+inline void dessiner_pastilles_vocales(esphome::display::Display &it, const Bas &bas) {
+  constexpr int largeur = 120, espace = 12;
+  constexpr int gauche = (LARGEUR - 3 * largeur - 2 * espace) / 2;
+  constexpr Etat etapes[] = {Etat::ECOUTE, Etat::REFLEXION, Etat::REPONSE};
+  constexpr esphome::Color couleurs[] = {C.ECOUTE, C.REFLEXION, C.REPONSE};
+  for (int i = 0; i < 3; i++) {
+    const int x = gauche + i * (largeur + espace);
+    const bool active = bas.etat == etapes[i];
+    const bool passee = !bas.annonce && etapes[i] < bas.etat;
+    const auto col = active ? couleurs[i] : passee ? C.VALIDE : C.PISTE;
+    it.filled_rectangle(x + 3, PASTILLES_Y, largeur - 6, PASTILLES_H, col);
+    it.filled_rectangle(x + 1, PASTILLES_Y + 1, largeur - 2, PASTILLES_H - 2, col);
+    it.filled_rectangle(x, PASTILLES_Y + 3, largeur, PASTILLES_H - 6, col);
+    if (active && bas.etat == Etat::ECOUTE) {
+      constexpr int piste = largeur - 12;
+      const int niveau = bas.animation * piste / NIVEAUX_MICRO;
+      if (niveau < piste) {
+        it.filled_rectangle(x + 6 + niveau, PASTILLES_Y + 3, piste - niveau, 4, C.VALIDE);
+      }
+    } else if (active && bas.etat == Etat::REFLEXION) {
+      it.filled_rectangle(x + 6 + 12 * bas.animation, PASTILLES_Y + 3, 12, 4, C.TEXTE);
+    }
+  }
+}
+
+inline void dessiner_message_vocal(esphome::display::Display &it, esphome::font::Font *petite, Etat etat) {
   using esphome::display::TextAlign;
+  constexpr uint8_t micro[] = {24, 36, 36, 165, 165, 126, 24};
+  constexpr uint8_t ampoule[] = {60, 66, 129, 129, 66, 60, 24};
+  constexpr uint8_t haut_parleur[] = {
+      0b00010010, 0b00111001, 0b11110101, 0b11110101, 0b11110101, 0b00111001, 0b00010010,
+  };
+  constexpr int centre_y = BAS_DEBUT + 36, bloc = 3, colonnes = 8, marge = 10;
+  constexpr int icone = colonnes * bloc;
+  const char *texte = etat == Etat::ECOUTE ? "J’écoute…" :
+                      etat == Etat::REFLEXION ? "Je réfléchis…" : "Je réponds…";
+  const auto col = etat == Etat::ECOUTE ? C.ECOUTE : etat == Etat::REFLEXION ? C.REFLEXION : C.REPONSE;
+  const auto pixels = etat == Etat::ECOUTE ? micro : etat == Etat::REFLEXION ? ampoule : haut_parleur;
+  const int centre_texte = (LARGEUR + icone + marge) / 2;
+  int x, y, largeur, hauteur;
+  it.get_text_bounds(centre_texte, centre_y, texte, petite, TextAlign::CENTER, &x, &y, &largeur, &hauteur);
+  dessiner_pixels(it, x - icone - marge, centre_y - icone / 2, pixels, bloc, colonnes, col);
+  it.print(centre_texte, centre_y, petite, C.TEXTE, TextAlign::CENTER, texte);
+}
+
+inline void dessiner_bas(esphome::display::Display &it, esphome::font::Font *petite, const Bas &bas) {
   it.start_clipping(0, BAS_DEBUT, LARGEUR, HAUTEUR);
-  const Etat etat = bas.etat;
   if (bas.revision_alerte) {
     dessiner_alerte(it, bas.icone_claire);
-  } else if (etat == Etat::CLAWD) {
+  } else if (bas.etat == Etat::CLAWD) {
     dessiner_temperature(it, bas.temperature);
-  } else if (etat != Etat::INCONNU) {
-    constexpr int x = 40, y = 430, h = 14, pas = SEGMENT + 20;
-    for (int i = 0; i < 3; i++) it.filled_rectangle(x + i * pas, y, SEGMENT, h, C.PISTE);
-    if (etat == Etat::ECOUTE && bas.barre > 0) {
-      it.filled_rectangle(x, y, bas.barre, h, C.ECOUTE);
-    } else if (etat == Etat::REFLEXION) {
-      it.filled_rectangle(x, y, SEGMENT, h, C.VALIDE);
-      it.filled_rectangle(x + pas + bas.barre, y, BLOC, h, C.REFLEXION);
-      // Ampoule de 14 × 16 px dans BAS, à gauche du texte de réflexion.
-      it.filled_rectangle(136, 457, 10, 2, C.REFLEXION);
-      it.filled_rectangle(134, 459, 14, 6, C.REFLEXION);
-      it.filled_rectangle(136, 465, 10, 4, C.REFLEXION);
-      it.filled_rectangle(138, 469, 6, 4, C.DISCRET);
-    } else if (etat == Etat::REPONSE) {
-      it.filled_rectangle(x, y, SEGMENT, h, C.VALIDE);
-      it.filled_rectangle(x + pas, y, SEGMENT, h, C.VALIDE);
-      it.filled_rectangle(x + 2 * pas + bas.barre, y, BLOC, h, C.REPONSE);
-    }
-    const char *texte = etat == Etat::ECOUTE ? "J'écoute..." :
-                        etat == Etat::REFLEXION ? "Je réfléchis..." : "Je réponds...";
-    it.print(240, 466, petite, C.TEXTE, TextAlign::CENTER, texte);
+  } else if (bas.etat != Etat::INCONNU) {
+    dessiner_pastilles_vocales(it, bas);
+    dessiner_message_vocal(it, petite, bas.etat);
   }
   it.end_clipping();
 }
@@ -1368,23 +1837,115 @@ inline float clawd_luminosite(clawd_detail::Phase phase, bool lampe_allumee) {
   return lampe_allumee ? SOIR_LAMPE_ALLUMEE : SOIR_LAMPE_ETEINTE;
 }
 
+inline void clawd_invalider(bool ecran_entier = true) {
+  auto &a = clawd_detail::affichage;
+  if (ecran_entier) {
+    a.complet = true;
+    a.brossage_invalide = true;
+  }
+  else a.milieu_invalide = true;
+  clawd_detail::animation.repos.actif = false;
+}
+
+inline void clawd_fermer_menu() {
+  using namespace clawd_detail;
+  if (!menu.ouvert) return;
+  menu.ouvert = menu.doigt_pose = false;
+  menu.ferme_a = esphome::millis();
+  clawd_invalider(false);
+}
+
+inline bool depart_bord(int x) { return x < clawd_detail::BORD_BALAYAGE; }
+
 inline bool clawd_appuyer(uint32_t t, int x, int y, uint8_t doigt) {
   using namespace clawd_detail;
   auto &g = interaction;
+  // Juste après la fermeture du menu, un toucher ne lance pas l'écoute.
+  if (t - menu.ferme_a < 1200) {
+    g.appui = false;
+    return false;
+  }
+  // Un toucher sur la bande de l'heure (en haut) ouvre le menu.
+  if (y < HAUT_FIN) {
+    g.appui = false;
+    menu.ouvert = true;
+    menu.toucher(t);
+    clawd_invalider(false);
+    return false;
+  }
   g.appui = true;
   g.appui_perso = y >= HAUT_FIN && y < BAS_DEBUT;
   g.calin_joue = false;
   g.debut_appui = t;
   g.doigt = doigt;
-  g.suivre(x);
+  g.x_depart = x;
+  g.y_depart = y;
+  g.deplacement_max_carre = 0;
+  g.balayage = false;
+  g.suivre(x, y);
   g.reaction = Reaction::AUCUNE;
-  return g.appui_perso;
+  return g.appui_perso && !depart_bord(x);
+}
+
+inline bool clawd_suivre_appui(uint32_t t, int x, int y) {
+  using namespace clawd_detail;
+  auto &g = interaction;
+  if (!g.appui) return false;
+  g.suivre(x, y);
+  // Le sens du capteur tactile est incertain : le bord gauche et le bord droit ouvrent le menu.
+  const int avance = g.x_depart < BORD_BALAYAGE ? g.x_courant - g.x_depart
+                     : g.x_depart >= LARGEUR - 60 ? g.x_depart - g.x_courant : 0;
+  if (avance < COURSE_BALAYAGE || t - g.debut_appui >= DUREE_BALAYAGE) return false;
+  g.balayage = true;
+  g.appui = false;
+  menu.ouvert = true;
+  menu.toucher(t);
+  clawd_invalider(false);
+  return true;
+}
+
+inline clawd_detail::ChoixMenu clawd_toucher_menu(uint32_t t, int x, int y) {
+  using namespace clawd_detail;
+  menu.toucher(t);
+  if (x >= DENTS_X && x < DENTS_X + DENTS_LARGEUR && y >= DENTS_Y && y < DENTS_Y + DENTS_HAUTEUR) {
+    minuteur.lancer_pour(t, DUREE_BROSSAGE, Minuteur::Mode::BROSSAGE);
+    interaction.reaction = Reaction::AUCUNE;
+    clawd_fermer_menu();
+    return ChoixMenu::RIEN;
+  }
+  const int dy = y - TUILE_Y;
+  const int rang = dy < 0 ? -1 : dy / TUILE_PAS;
+  const bool dans_rang = dy >= 0 && dy % TUILE_PAS < TUILE_HAUTEUR;
+  if (rang == 1 && dans_rang) {
+    for (size_t i = 0; i < std::size(AJUST_X); ++i) {
+      if (x >= AJUST_X[i] && x < AJUST_X[i] + AJUST_LARGEUR) {
+        minuteur.choix = std::clamp(minuteur.choix + AJUST_PAS[i], 1, 99);
+        return ChoixMenu::RIEN;
+      }
+    }
+  } else if (rang == 2 && dans_rang) {
+    if (x >= TUILE_X && x < TUILE_X + (minuteur.duree ? DEMARRER_LARGEUR : TUILE_LARGEUR)) {
+      minuteur.lancer(t, minuteur.choix);
+      clawd_fermer_menu();
+      return ChoixMenu::RIEN;
+    }
+    if (minuteur.duree && x >= ANNULER_X && x < ANNULER_X + ANNULER_LARGEUR) {
+      minuteur.effacer();
+      clawd_fermer_menu();
+      return ChoixMenu::RIEN;
+    }
+  } else if (rang == 0 && dans_rang) {
+    return ChoixMenu::RIEN;  // L'affichage de la durée ne fait rien.
+  }
+  clawd_fermer_menu();  // Barre RETOUR ou toucher hors des boutons.
+  return ChoixMenu::RIEN;
 }
 
 inline void clawd_appui_long(uint32_t t) {
   using namespace clawd_detail;
   auto &g = interaction;
-  if (!g.appui || !g.appui_perso || g.calin_joue || t - g.debut_appui < APPUI_LONG) return;
+  if (!g.appui || !g.appui_perso || g.calin_joue || g.a_derive() || depart_bord(g.x_depart) ||
+      t - g.debut_appui < APPUI_LONG) return;
   g.calin_joue = true;
   g.jouer(Reaction::CALIN, t);
 }
@@ -1392,12 +1953,13 @@ inline void clawd_appui_long(uint32_t t) {
 inline bool clawd_relacher(uint32_t t) {
   using namespace clawd_detail;
   auto &g = interaction;
+  menu.relacher(t);
   if (!g.appui) return false;
   // Traite aussi un relâchement reçu avant l'exécution du script des 700 ms.
   clawd_appui_long(t);
   g.appui = false;
   // Entre 600 et 699 ms, le relâchement termine uniquement le suivi du doigt.
-  return t - g.debut_appui < TOUCHER_COURT;
+  return !g.balayage && !depart_bord(g.x_depart) && !g.a_derive() && t - g.debut_appui < TOUCHER_COURT;
 }
 
 inline int clawd_temperature(float valeur) {
@@ -1409,88 +1971,194 @@ inline int clawd_temperature(float valeur) {
   return static_cast<int>(dixiemes);
 }
 
-inline uint8_t clawd_tick(const std::string &etat, uint32_t t, bool vocal, int minute, int seconde,
-                          int jour, int mois, bool reactions, float temperature, float micro,
-                          clawd_detail::Costume costume) {
+inline uint16_t clawd_actualiser_bas(clawd_detail::Etat etat, bool annonce, uint32_t t, float temperature, float micro) {
+  using namespace clawd_detail;
+  auto &a = affichage;
+  a.bas = {};
+  if (etat == Etat::CLAWD && alerte.active) {
+    a.bas.revision_alerte = alerte.revision;
+    // Deux cycles clair/atténué par seconde, sur la seule surface de l'icône.
+    a.bas.icone_claire = ((t - alerte.debut) / 250) % 2 == 0;
+  } else {
+    a.bas.etat = etat;
+    a.bas.annonce = annonce;
+    if (etat == Etat::CLAWD) {
+      a.bas.temperature = clawd_temperature(temperature);
+    } else if (etat == Etat::ECOUTE && std::isfinite(micro)) {
+      a.bas.animation = std::lround(std::clamp(micro, 0.0f, 1.0f) * NIVEAUX_MICRO);
+    } else if (etat == Etat::REFLEXION) {
+      const int pas = (t - a.debut_etat) / PAS_ANIMATION_VOCALE % 16;
+      a.bas.animation = std::min(pas, 16 - pas);
+    }
+  }
+  if (a.bas.contenu_change(a.bas_dessine) &&
+      (a.bas.etat != a.bas_dessine.etat || a.bas_disponible(t))) return BAS;
+  if (a.bas.animation != a.bas_dessine.animation && t - a.dernier_bas >= PAS_ANIMATION_VOCALE) {
+    return PASTILLES_VOCALES;
+  }
+  if (a.bas.icone_claire != a.bas_dessine.icone_claire && a.bas_disponible(t)) return ICONE_ALERTE;
+  return 0;
+}
+
+inline uint16_t clawd_tick(clawd_detail::Etat suivant, uint32_t t, bool vocal, bool interface_libre, bool annonce,
+                           int minute, int seconde, int jour, int mois, bool reactions, float temperature,
+                           float micro, clawd_detail::Costume costume) {
   using namespace clawd_detail;
   auto &a = affichage;
   auto &repos = animation.repos;
-  const Etat suivant = lire_etat(etat);
+  if (!interface_libre || menu.inactif(t)) clawd_fermer_menu();
   const bool entree_ecoute = !vocal && suivant == Etat::ECOUTE && a.etat != suivant;
   if (a.etat != suivant) {
     a.etat = suivant;
     a.debut_etat = t;
   }
+  a.t = t;
+  const bool brossage = minuteur.mode == Minuteur::Mode::BROSSAGE;
+  if (a.ecran_brossage && !brossage) {
+    a.ecran_brossage = false;
+    clawd_invalider();
+  }
   if (reactions) repos.climat = mesurer_climat(repos.climat, temperature);
   else repos.couper_reactions();
-  if (vocal) repos.actif = false;
+  if (vocal) {
+    a.brossage_invalide = true;
+    repos.actif = false;
+    pluie_matrix.en_pause = true;
+    // Pendant l'audio, seuls les transferts de la bande vocale sont autorisés.
+    if (suivant == Etat::CLAWD && !annonce) return a.zones = 0;
+    return a.zones = clawd_actualiser_bas(annonce ? Etat::REPONSE : suivant, annonce, t, temperature, micro);
+  }
+
+  if (brossage) {
+    repos.actif = false;
+    pluie_matrix.en_pause = true;
+    if (!interface_libre) return a.zones = 0;
+    a.brossage = minuteur.ecoule ? DUREE_BROSSAGE : t - minuteur.debut;
+    const auto precedent = a.brossage_dessine;
+    if (!a.ecran_brossage || a.brossage_invalide ||
+        (a.brossage == DUREE_BROSSAGE && precedent != a.brossage)) return a.zones = BROSSAGE_COMPLET;
+    if (a.brossage == DUREE_BROSSAGE) return a.zones = 0;
+    a.zones = 0;
+    if (pas_brosse(a.brossage) != pas_brosse(precedent)) a.zones |= BROSSAGE_PERSO;
+    if (a.brossage / 1000 != precedent / 1000) a.zones |= BROSSAGE_TEMPS;
+    if (a.brossage / DUREE_ZONE_DENTS != precedent / DUREE_ZONE_DENTS ||
+        changement_dents(a.brossage) != changement_dents(precedent)) a.zones |= BROSSAGE_CONSIGNE;
+    return a.zones;
+  }
 
   // Attend la fin du son avant un redessin complet.
-  const bool libre = !vocal && suivant == Etat::CLAWD;
-  const bool complet = libre && a.complet;
+  const bool libre = suivant == Etat::CLAWD;
+  const bool complet = interface_libre && a.complet && !menu.ouvert;
   const bool matrix = costume == Costume::MATRIX;
-  if (!libre || !matrix) pluie_matrix.en_pause = true;
-  a.t = t;
+  if (!libre || !matrix || menu.ouvert || (a.milieu_invalide && !interface_libre)) pluie_matrix.en_pause = true;
 
   // L'heure reste fixe pendant l'échange. Sinon seul le « : » clignote entre deux minutes.
-  a.haut = libre ? Haut{minute, jour, mois, minute < 0 || seconde % 2 == 0} : a.haut_dessine;
-  if (!complet && a.haut.minute != a.haut_dessine.minute) {
-    // Le pilote englobe tout le dessin dans un rectangle. Reprendre les autres zones au prochain tick.
-    return a.zones = HEURE;
-  }
-  uint8_t zones = complet ? COMPLET : 0;
-  if (!complet && (a.haut.jour != a.haut_dessine.jour || a.haut.mois != a.haut_dessine.mois)) zones |= DATE;
-  if (!complet && a.haut.deux_points != a.haut_dessine.deux_points) zones |= DEUX_POINTS;
-
-  if (libre || entree_ecoute) calcul_pose(suivant, t, reactions, costume);
-  if ((libre || entree_ecoute) && (complet || t - a.dernier_perso >= PAS_PERSO)) {
-    const bool pluie_change = libre && matrix && pluie_matrix.avancer(t);
-    if (pluie_change || std::memcmp(&animation.courante, &animation.dessinee, sizeof(Frame)) != 0) zones |= PERSO;
+  a.haut = interface_libre ? Haut{minute, jour, mois, minute < 0 || seconde % 2 == 0} : a.haut_dessine;
+  uint16_t zones = complet ? COMPLET : 0;
+  if (!complet) {
+    if (a.haut.minute != a.haut_dessine.minute) zones |= HEURE;
+    else if (a.haut.deux_points != a.haut_dessine.deux_points) zones |= DEUX_POINTS;
+    if (a.haut.jour != a.haut_dessine.jour || a.haut.mois != a.haut_dessine.mois) zones |= DATE;
   }
 
-  a.bas = {};
-  if (suivant == Etat::CLAWD && alerte.active) {
-    a.bas.revision_alerte = alerte.revision;
-    // Deux cycles clair/atténué par seconde, sur la seule surface de l'icône.
-    a.bas.icone_claire = ((t - alerte.debut) / 250) % 2 == 0;
-  } else {
-    a.bas.etat = suivant;
-    if (suivant == Etat::CLAWD) {
-      a.bas.temperature = clawd_temperature(temperature);
-    } else if (suivant == Etat::ECOUTE) {
-      a.bas.barre = 2 * std::lround(std::clamp(micro, 0.0f, 1.0f) * (SEGMENT / 2));
-    } else {
-      a.bas.barre = position_bloc(t - a.debut_etat);
+  if (menu.ouvert && interface_libre) {
+    a.tuiles = {false, minuteur.duree != 0, Costume::AUCUN, minuteur.choix};
+    if (a.milieu_invalide || a.tuiles.choix != a.tuiles_dessinees.choix) zones |= MENU_MINUTEUR;
+    if (a.milieu_invalide) zones |= MENU_BUREAU;
+    if (a.milieu_invalide || a.tuiles.minuteur != a.tuiles_dessinees.minuteur) zones |= MENU_DEGUISEMENT;
+  } else if (!menu.ouvert && (!a.milieu_invalide || interface_libre) && (libre || entree_ecoute)) {
+    calcul_pose(suivant, t, reactions, costume);
+    if (complet || a.milieu_invalide || t - a.dernier_perso >= PAS_PERSO) {
+      const bool pluie_change = libre && matrix && pluie_matrix.avancer(t);
+      if (a.milieu_invalide || pluie_change ||
+          std::memcmp(&animation.courante, &animation.dessinee, sizeof(Frame)) != 0) zones |= PERSO;
     }
   }
-  if (!complet && a.bas_disponible(t)) {
-    if (a.bas.contenu_change(a.bas_dessine)) zones |= BAS;
-    else if (a.bas.icone_claire != a.bas_dessine.icone_claire) zones |= ICONE_ALERTE;
+  if (interface_libre && !menu.ouvert) {
+    a.minuteur = minuteur.affichage(t);
+    if (a.minuteur != a.minuteur_dessine) zones |= MINUTEUR;
   }
-  return a.zones = zones;
-}
 
-inline void clawd_invalider() {
-  clawd_detail::affichage.complet = true;
-  clawd_detail::animation.repos.actif = false;
+  const uint16_t zones_bas = clawd_actualiser_bas(suivant, false, t, temperature, micro);
+  if (!complet) zones |= zones_bas;
+  return a.zones = zones;
 }
 
 inline void clawd_dessiner(esphome::display::Display &it, esphome::font::Font *petite) {
   using namespace clawd_detail;
   auto &a = affichage;
-  uint8_t zones = a.zones;
-  const bool complet = zones == COMPLET;
+  uint16_t zones = a.zones;
+  if (zones & (BROSSAGE_COMPLET | BROSSAGE_TEMPS | BROSSAGE_PERSO | BROSSAGE_CONSIGNE)) {
+    constexpr int fin_temps = BROSSAGE_TEMPS_Y + HAUTEUR_CHIFFRE * BROSSAGE_TEMPS_BLOC;
+    if (zones & BROSSAGE_COMPLET) {
+      it.filled_rectangle(0, 0, LARGEUR, HAUTEUR, C.BG);
+      if (a.brossage == DUREE_BROSSAGE) {
+        dessiner_bravo(it);
+      } else {
+        dessiner_temps_brossage(it, a.brossage);
+        dessiner_perso_brossage(it, a.brossage);
+        dessiner_consigne_brossage(it, a.brossage);
+      }
+      a.ecran_brossage = true;
+      a.brossage_invalide = false;
+      a.zones = 0;
+    } else if (zones & BROSSAGE_TEMPS) {
+      it.filled_rectangle(0, BROSSAGE_TEMPS_Y, LARGEUR, fin_temps - BROSSAGE_TEMPS_Y, C.BG);
+      dessiner_temps_brossage(it, a.brossage);
+      a.zones &= ~BROSSAGE_TEMPS;
+    } else if (zones & BROSSAGE_PERSO) {
+      // La bande couvre toute la course des bulles et de la tête inclinée.
+      constexpr int debut = 6 * T - 12, fin = 15 * T + 12;
+      it.filled_rectangle(0, debut, LARGEUR, fin - debut, C.BG);
+      it.start_clipping(0, debut, LARGEUR, fin);
+      dessiner_perso_brossage(it, a.brossage);
+      it.end_clipping();
+      a.zones &= ~BROSSAGE_PERSO;
+    } else {
+      it.filled_rectangle(0, BROSSAGE_CONSIGNE_Y, LARGEUR, HAUTEUR - BROSSAGE_CONSIGNE_Y, C.BG);
+      dessiner_consigne_brossage(it, a.brossage);
+      a.zones &= ~BROSSAGE_CONSIGNE;
+    }
+    if (!a.zones) a.brossage_dessine = a.brossage;
+    return;
+  }
+  const bool complet = zones & COMPLET;
   // Hors redessin complet, isoler les petits transferts du haut des animations.
-  if (!complet) {
-    if (zones & DATE) zones = DATE;
+  if (complet) {
+    zones = HEURE | DATE | PERSO | BAS | MINUTEUR;
+  } else {
+    if (zones & MENU_MINUTEUR) zones = MENU_MINUTEUR;
+    else if (zones & MENU_BUREAU) zones = MENU_BUREAU;
+    else if (zones & MENU_DEGUISEMENT) zones = MENU_DEGUISEMENT;
+    else if ((zones & PERSO) && a.milieu_invalide) zones = PERSO;
+    else if (zones & MINUTEUR) zones = MINUTEUR;
+    else if (zones & HEURE) zones = HEURE;
+    else if (zones & DATE) zones = DATE;
     else if (zones & DEUX_POINTS) zones = DEUX_POINTS;
+    // Garder deux transferts distincts si BAS et PERSO changent ensemble au repos.
+    else if (zones & PERSO) zones = PERSO;
+  }
+  if (zones == MENU_MINUTEUR || zones == MENU_BUREAU || zones == MENU_DEGUISEMENT) {
+    dessiner_tuile(it, static_cast<Zone>(zones), a.tuiles);
+    if (zones == MENU_MINUTEUR) a.tuiles_dessinees.choix = a.tuiles.choix;
+    if (zones == MENU_DEGUISEMENT) {
+      a.tuiles_dessinees.minuteur = a.tuiles.minuteur;
+      a.milieu_invalide = false;
+    }
   }
   if (complet) it.filled_rectangle(0, 0, LARGEUR, HAUT_FIN, C.BG);
   if (zones & PERSO) {
     it.filled_rectangle(0, HAUT_FIN, LARGEUR, BAS_DEBUT - HAUT_FIN, C.BG);
+    it.start_clipping(0, HAUT_FIN, LARGEUR, BAS_DEBUT);
     dessiner_perso(it, animation.courante);
+    it.end_clipping();
     animation.dessinee = animation.courante;
     a.dernier_perso = a.t;
+    a.milieu_invalide = false;
+  }
+  if (zones & MINUTEUR) {
+    if (!complet || a.minuteur >= 0) dessiner_minuteur(it, a.minuteur);
+    a.minuteur_dessine = a.minuteur;
   }
   if (zones & HEURE) {
     dessiner_heure(it, a.haut, a.haut_dessine, complet);
@@ -1512,12 +2180,21 @@ inline void clawd_dessiner(esphome::display::Display &it, esphome::font::Font *p
     dessiner_bas(it, petite, a.bas);
     a.bas_dessine = a.bas;
     a.dernier_bas = a.t;
+  } else if (zones & PASTILLES_VOCALES) {
+    dessiner_pastilles_vocales(it, a.bas);
+    pleine_largeur(it, PASTILLES_Y, PASTILLES_Y + PASTILLES_H - 1);
+    a.bas_dessine.animation = a.bas.animation;
+    a.dernier_bas = a.t;
   } else if (zones & ICONE_ALERTE) {
     dessiner_icone_alerte(it, a.bas.icone_claire);
     pleine_largeur(it, BAS_DEBUT + 8, BAS_DEBUT + 47);
     a.bas_dessine.icone_claire = a.bas.icone_claire;
     a.dernier_bas = a.t;
   }
-  if (complet) a.complet = false;
-  a.zones &= ~zones;
+  if (complet) {
+    a.complet = false;
+    a.zones = 0;
+  } else {
+    a.zones &= ~zones;
+  }
 }

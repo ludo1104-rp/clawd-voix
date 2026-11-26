@@ -3,7 +3,7 @@
 Assistant vocal local pour la carte **Waveshare ESP32-S3-Touch-AMOLED-2.16**, avec Home Assistant.
 Clawd, un petit personnage animé, s'affiche à l'écran. La carte écoute, Home Assistant comprend et agit, puis la carte répond à voix haute.
 
-Tout reste à la maison : Whisper (voix en texte), commandes locales de Home Assistant, Piper (texte en voix).
+Deux configurations possibles dans Home Assistant : tout en local (Whisper, commandes locales, Piper) ou via OpenAI (intégration « ChatGPT », clé API personnelle). Langue des services OpenAI : `fr-FR`.
 
 ## Fonctions
 - Mot d'éveil « Okay Nabu » ou toucher de l'écran.
@@ -15,7 +15,10 @@ Tout reste à la maison : Whisper (voix en texte), commandes locales de Home Ass
 1. Installer [ESPHome](https://esphome.io) (2026.11).
 2. Copier `secrets.exemple.yaml` en `secrets.yaml` et le remplir.
 3. Téléverser : `esphome run clawd-voix.yaml`
-4. Dans Home Assistant, créer un assistant avec Whisper et Piper et le choisir pour la carte.
+4. Dans Home Assistant, créer un assistant (Whisper et Piper, ou OpenAI) et le choisir pour la carte.
+
+- Minuteur : toucher l'heure pour ouvrir le menu (1 à 99 min), carillon à la fin.
+- Fiche d'état en bas de l'écran et mode nuit.
 
 ## Pièges connus
 - Broches des données I2S inversées dans la documentation Waveshare : micro = GPIO10, haut-parleur = GPIO8.
